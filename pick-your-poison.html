@@ -1,146 +1,29 @@
--- Run once in Supabase SQL Editor. This does not modify jar_* tables.
-create extension if not exists pgcrypto;
-create table if not exists public.poison_library (
- id uuid primary key default gen_random_uuid(), author_id uuid not null references auth.users(id) on delete cascade,
- category text not null, option_a text not null, option_b text not null, twist text not null default '',
- created_at timestamptz not null default now(),
- constraint poison_text_valid check (length(trim(category)) between 1 and 100 and length(trim(option_a)) between 1 and 500 and length(trim(option_b)) between 1 and 500 and length(twist)<=500)
-);
-create table if not exists public.poison_rooms (
- id uuid primary key default gen_random_uuid(), code text not null unique,
- host_id uuid not null references auth.users(id), guest_id uuid references auth.users(id),
- started_at timestamptz, duration_seconds integer not null default 1800,
- closed_at timestamptz, current_card uuid, twist_visible boolean not null default false,
- created_at timestamptz not null default now(),
- constraint poison_duration_valid check(duration_seconds between 300 and 7200)
-);
-create table if not exists public.poison_room_cards (
- id uuid primary key default gen_random_uuid(), room_id uuid not null references public.poison_rooms(id) on delete cascade,
- category text not null, option_a text not null, option_b text not null, twist text not null default '',
- drawn_at timestamptz, created_at timestamptz not null default now()
-);
-create table if not exists public.poison_votes (
- room_id uuid not null references public.poison_rooms(id) on delete cascade,
- card_id uuid not null references public.poison_room_cards(id) on delete cascade,
- player_id uuid not null references auth.users(id), choice text not null check(choice in ('A','B')),
- primary key(card_id,player_id)
-);
-create index if not exists poison_room_cards_room_idx on public.poison_room_cards(room_id);
-create index if not exists poison_library_author_idx on public.poison_library(author_id);
-alter table public.poison_library enable row level security;
-alter table public.poison_rooms enable row level security;
-alter table public.poison_room_cards enable row level security;
-alter table public.poison_votes enable row level security;
-revoke all on public.poison_rooms,public.poison_room_cards,public.poison_votes from anon,authenticated;
-grant select,insert,update,delete on public.poison_library to authenticated;
-drop policy if exists poison_library_owner on public.poison_library;
-create policy poison_library_owner on public.poison_library for all to authenticated using(author_id=(select auth.uid())) with check(author_id=(select auth.uid()));
--- Rooms/cards/votes are only accessed through validated SECURITY DEFINER RPCs.
-create or replace function public.poison_create() returns jsonb language plpgsql security definer set search_path='' as $$
-declare r public.poison_rooms; c text; i int;
-begin
- if auth.uid() is null then raise exception 'Sign in first'; end if;
- for i in 1..15 loop
-  c:=upper(substr(encode(gen_random_bytes(5),'hex'),1,8));
-  begin insert into public.poison_rooms(code,host_id) values(c,auth.uid()) returning * into r; exit;
-  exception when unique_violation then null; end;
- end loop;
- if r.id is null then raise exception 'Could not create room'; end if;
- return jsonb_build_object('id',r.id,'code',r.code);
-end $$;
-create or replace function public.poison_join(p_code text) returns jsonb language plpgsql security definer set search_path='' as $$
-declare r public.poison_rooms;
-begin
- if auth.uid() is null then raise exception 'Sign in first'; end if;
- select * into r from public.poison_rooms where code=upper(trim(p_code)) for update;
- if not found then raise exception 'Room not found'; end if;
- if r.host_id<>auth.uid() and r.guest_id is distinct from auth.uid() then
-  if r.guest_id is not null then raise exception 'Room already has two players'; end if;
-  update public.poison_rooms set guest_id=auth.uid() where id=r.id;
- end if;
- return jsonb_build_object('id',r.id,'code',r.code);
-end $$;
-create or replace function public.poison_state(p_room uuid) returns jsonb language plpgsql security definer set search_path='' as $$
-declare r public.poison_rooms; c public.poison_room_cards; mine text; total int; drawn int; vote_count int; revealed boolean; result jsonb;
-begin
- select * into r from public.poison_rooms where id=p_room;
- if not found or auth.uid() is null or auth.uid() not in (r.host_id,r.guest_id) then raise exception 'Not a room member'; end if;
- if r.current_card is not null then select * into c from public.poison_room_cards where id=r.current_card and room_id=p_room; end if;
- select count(*) into total from public.poison_room_cards where room_id=p_room and drawn_at is null;
- select count(*) into drawn from public.poison_room_cards where room_id=p_room and drawn_at is not null;
- select count(*) into vote_count from public.poison_votes where card_id=r.current_card;
- select choice into mine from public.poison_votes where card_id=r.current_card and player_id=auth.uid();
- revealed:=vote_count=2;
- result:=jsonb_build_object('code',r.code,'host',r.host_id=auth.uid(),'guest_connected',r.guest_id is not null,
-  'started_at',r.started_at,'closed_at',r.closed_at,'duration_seconds',r.duration_seconds,
-  'remaining',total,'drawn',drawn,'votes_cast',vote_count,'my_vote',mine,'revealed',revealed);
- if c.id is not null then
-  result:=result||jsonb_build_object('card',jsonb_build_object('id',c.id,'category',c.category,'a',c.option_a,'b',c.option_b,'twist',case when r.twist_visible then c.twist else null end));
-  if revealed then result:=result||jsonb_build_object('votes',(select jsonb_agg(jsonb_build_object('player',case when v.player_id=r.host_id then 'Host' else 'Guest' end,'choice',v.choice) order by case when v.player_id=r.host_id then 0 else 1 end) from public.poison_votes v where v.card_id=c.id)); end if;
- end if;
- return result;
-end $$;
-create or replace function public.poison_start(p_room uuid,p_minutes integer default 30) returns void language plpgsql security definer set search_path='' as $$
-declare r public.poison_rooms;
-begin
- select * into r from public.poison_rooms where id=p_room for update;
- if not found or r.host_id<>auth.uid() then raise exception 'Only host can start'; end if;
- if r.guest_id is null then raise exception 'Wait for the second player'; end if;
- if r.started_at is not null then raise exception 'Already started'; end if;
- if p_minutes not in (15,30,45,60) then raise exception 'Invalid duration'; end if;
- insert into public.poison_room_cards(room_id,category,option_a,option_b,twist)
- select p_room,category,option_a,option_b,twist from public.poison_library where author_id in (r.host_id,r.guest_id);
- if not found then raise exception 'Add cards in Question Studio first'; end if;
- update public.poison_rooms set started_at=now(),duration_seconds=p_minutes*60 where id=p_room;
-end $$;
-
-create or replace function public.poison_draw(p_room uuid)
-returns void
-language plpgsql
-security definer
-set search_path=''
-as $$
-declare
-    r public.poison_rooms;
-    chosen uuid;
-begin
-    select * into r
-    from public.poison_rooms
-    where id = p_room
-    for update;
-
-    if not found
-       or auth.uid() not in (r.host_id, r.guest_id)
-    then
-        raise exception 'Not a room member';
-    end if;
-
-    if r.started_at is null
-       or r.closed_at is not null
-       or now() >= r.started_at
-          + make_interval(secs => r.duration_seconds)
-    then
-        raise exception 'Room not active';
-    end if;
-
-    select id into chosen
-    from public.poison_room_cards
-    where room_id = p_room
-      and drawn_at is null
-    order by random()
-    limit 1;
-
-    if chosen is null then
-        raise exception 'No undrawn cards left';
-    end if;
-
-    update public.poison_room_cards
-    set drawn_at = now()
-    where id = chosen;
-
-    update public.poison_rooms
-    set current_card = chosen,
-        twist_visible = false
-    where id = p_room;
-end;
-$$;
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pick Your Poison · LilWeird After Dark</title><style>:root{--bg:#0c1919;--panel:#172625;--gold:#d5aa52;--cream:#f4ead7;--muted:#c1b398;--border:#655638}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 85% 0%,#253632,transparent 45%),var(--bg);color:var(--cream);font:16px/1.5 Georgia,serif}main{max-width:1040px;margin:auto;padding:22px 16px 55px}header{text-align:center;padding:18px 0 22px}h1{font-weight:normal;font-size:clamp(35px,6vw,55px);margin:5px}h2{font-weight:normal}.eyebrow{font:12px system-ui;letter-spacing:.15em;text-transform:uppercase;color:var(--gold)}.sub,.muted{color:var(--muted)}.muted{font-size:13px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:22px;margin:14px 0}.tabs,.actions{display:flex;flex-wrap:wrap;gap:9px}.tabs button.active{background:var(--gold);color:#101b1b}button,input,select,textarea{font:inherit}button{border-radius:9px;padding:10px 14px;border:1px solid var(--gold);background:transparent;color:var(--cream);cursor:pointer}button.primary{background:var(--gold);color:#101b1b;font-weight:bold}button:disabled{opacity:.4;cursor:not-allowed}input,select,textarea{width:100%;border:1px solid var(--border);background:#0d1a1a;color:var(--cream);padding:10px;border-radius:8px;margin:6px 0 14px}textarea{min-height:78px}label{display:block;color:var(--gold);font:12px system-ui}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.choice{background:#102020;border:1px solid #8d7443;border-radius:14px;padding:24px;min-height:180px;text-align:center;display:flex;flex-direction:column;justify-content:center;gap:15px}.choice strong{color:var(--gold);font:13px system-ui}.choice p{font-size:22px;margin:0}.timer{font-size:42px;color:var(--gold);font-variant-numeric:tabular-nums}.row{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.hidden{display:none!important}.entry{border-top:1px solid var(--border);padding:12px 0}.entry button{padding:5px 9px;font-size:12px;margin-right:6px}.notice{background:#253632;padding:12px;border-radius:8px;margin:12px 0}a{color:var(--gold)}@media(max-width:650px){.grid{grid-template-columns:1fr}.panel{padding:15px}}</style></head><body><main>
+<header><div class="eyebrow">✦ LilWeird After Dark ✦</div><h1>⚗ Pick Your Poison</h1><div class="sub">Two choices. One questionable decision.</div><p class="muted"><a href="index.html">← Game Hub</a> · Online two-player edition</p></header>
+<section class="panel" id="setup"><h2>Connect to Supabase</h2><p class="muted">Use the same Supabase URL and publishable/anon key as Curiosity Jar. Never use a service-role or secret key here.</p><label>Project URL</label><input id="url" placeholder="https://your-project.supabase.co"><label>Publishable / anon key</label><input id="key" placeholder="sb_publishable_... or eyJ..."><button class="primary" id="connect">Connect</button></section>
+<section class="panel hidden" id="lobby"><div class="row"><h2>Play together</h2><span id="connection" class="muted">Connected</span></div><div class="actions"><button class="primary" id="create">Create room</button><input id="joinCode" maxlength="8" placeholder="Room code" style="max-width:170px;margin:0"><button id="join">Join room</button></div><div id="roomInfo" class="notice hidden"></div><p id="message" role="status" class="muted"></p></section>
+<div class="tabs hidden" id="tabs"><button data-tab="play" class="active">Play</button><button data-tab="studio">Question Studio</button></div>
+<section id="play" class="hidden"><div class="panel"><div class="row"><div><div class="eyebrow" id="category">The poisons await</div><h2 id="prompt">Create or join a room to play.</h2></div><div style="text-align:center"><div class="timer" id="timer">30:00</div><span id="count" class="muted">Waiting</span></div></div><div class="grid"><div class="choice"><strong>POISON A</strong><p id="a">?</p><button id="voteA" disabled>Choose A</button></div><div class="choice"><strong>POISON B</strong><p id="b">?</p><button id="voteB" disabled>Choose B</button></div></div><div class="notice" id="voteStatus">Waiting for both players.</div><div class="notice hidden" id="reveal"></div><div class="notice hidden" id="twist"></div><div class="actions"><button class="primary" id="draw" disabled>Draw dilemma</button><button id="showTwist" disabled>Reveal poisonous twist</button><button id="close" disabled>End room</button></div><div class="row" style="margin-top:20px"><label>Session duration<select id="duration"><option value="15">15 minutes</option><option value="30" selected>30 minutes</option><option value="45">45 minutes</option><option value="60">60 minutes</option></select></label><button class="primary" id="start" disabled>Start shared timer &amp; deck</button></div><p class="muted">Both players' saved library cards are copied into the room when the host starts. A card is not repeated during that session. Both players see the same dilemma; votes remain private until both have chosen.</p></div></section>
+<section id="studio" class="hidden"><div class="grid"><div class="panel"><h2>Question Studio</h2><p class="muted">Your personal library is saved to Supabase, even outside a room. Each browser's anonymous identity has its own library.</p><form id="form"><input id="editId" type="hidden"><label>Category</label><input id="catInput" required maxlength="100" placeholder="Everyday Curses"><label>Poison A</label><textarea id="aInput" required maxlength="500"></textarea><label>Poison B</label><textarea id="bInput" required maxlength="500"></textarea><label>Optional twist</label><textarea id="twistInput" maxlength="500"></textarea><button class="primary" type="submit">Save card</button> <button id="cancelEdit" type="button">Clear form</button></form><button id="export">Export JSON backup</button><label>Import JSON cards<input id="import" type="file" accept=".json,application/json"></label><p class="muted">Import adds cards to your personal library. Export regularly for safekeeping.</p></div><div class="panel"><h2>My Card Library</h2><div id="library"></div></div></div></section>
+</main><script type="module">
+import {createClient} from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+const $=id=>document.getElementById(id);let sb,user,roomId=null,roomState=null,library=[],poll=null,timerTick=null,busy=false;const show=(id,on)=>$(id).classList.toggle('hidden',!on);const status=s=>$('message').textContent=s;const error=e=>status('⚠ '+(e?.message||String(e)));const rpc=async(name,args={})=>{const {data,error}=await sb.rpc(name,args);if(error)throw error;return data};
+$('url').value=localStorage.getItem('jar_url')||'';$('key').value=localStorage.getItem('jar_key')||'';
+async function connect(){try{const url=$('url').value.trim(),key=$('key').value.trim();if(!url.startsWith('https://')||!key)throw Error('Enter a valid URL and key');sb=createClient(url,key,{auth:{persistSession:true,autoRefreshToken:true}});let {data:{session},error:authError}=await sb.auth.getSession();if(authError)throw authError;if(!session){const signed=await sb.auth.signInAnonymously();if(signed.error)throw signed.error;session=signed.data.session}user=session.user;localStorage.setItem('jar_url',url);localStorage.setItem('jar_key',key);show('setup',false);show('lobby',true);show('tabs',true);show('studio',true);document.querySelector('[data-tab=studio]').click();await loadLibrary();status('Connected. Create or join a room, or add cards in Question Studio.');const saved=localStorage.getItem('poison_room');if(saved){roomId=saved;try{await enter({id:saved})}catch{roomId=null;localStorage.removeItem('poison_room')}}}catch(e){alert(e.message)}}$('connect').onclick=connect;
+async function enter(info){roomId=info.id;localStorage.setItem('poison_room',roomId);document.querySelector('[data-tab=play]').click();await refresh();clearInterval(poll);poll=setInterval(()=>refresh().catch(error),1600);clearInterval(timerTick);timerTick=setInterval(()=>{renderTimer();const s=roomState;if(s){$('close').disabled=!s.host||!s.started_at||!!s.closed_at;$('draw').disabled=!active()||!s.remaining;$('voteA').disabled=!active()||!s.card||!!s.my_vote;$('voteB').disabled=!active()||!s.card||!!s.my_vote;}},250)}
+$('create').onclick=async()=>{try{await enter(await rpc('poison_create'))}catch(e){error(e)}};
+$('join').onclick=async()=>{try{await enter(await rpc('poison_join',{p_code:$('joinCode').value}))}catch(e){error(e)}};
+async function refresh(){if(!roomId||busy)return;busy=true;try{roomState=await rpc('poison_state',{p_room:roomId});render()}finally{busy=false}}
+function active(){const s=roomState;return !!(s?.started_at&&!s.closed_at&&Date.now()<Date.parse(s.started_at)+s.duration_seconds*1000)}
+function renderTimer(){const s=roomState;if(!s)return;let remaining=s.started_at?Math.max(0,Math.ceil((Date.parse(s.started_at)+s.duration_seconds*1000-Date.now())/1000)):s.duration_seconds;$('timer').textContent=String(Math.floor(remaining/60)).padStart(2,'0')+':'+String(remaining%60).padStart(2,'0')}
+function render(){const s=roomState;if(!s)return;show('roomInfo',true);$('roomInfo').textContent='Room code: '+s.code+' · '+(s.guest_connected?'Both hosts connected':'Waiting for second host')+' · '+(s.host?'You are host':'You are guest');$('count').textContent=s.drawn+' drawn · '+s.remaining+' undrawn';$('duration').disabled=!!s.started_at||!s.host;$('start').disabled=!!s.started_at||!s.host||!s.guest_connected;$('draw').disabled=!active()||!s.remaining;$('close').disabled=!s.host||!s.started_at||!!s.closed_at;$('showTwist').disabled=!active()||!s.card||!!s.card.twist;const c=s.card;$('category').textContent=c?.category||'The poisons await';$('prompt').textContent=c?'Which poison would you pick?':s.started_at?'Draw your first dilemma.':'Waiting for the host to start.';$('a').textContent=c?.a||'?';$('b').textContent=c?.b||'?';$('voteA').disabled=!active()||!c||!!s.my_vote;$('voteB').disabled=!active()||!c||!!s.my_vote;let message=!c?'Waiting for a card.':s.revealed?'Both votes are in! Defend your choices.':s.my_vote?'Your choice is locked. Waiting for the other host.':'Choose your poison. Your answer stays hidden until both vote.';$('voteStatus').textContent=message;show('reveal',!!s.revealed);if(s.revealed)$('reveal').textContent=(s.votes||[]).map(v=>v.player+' chose Poison '+v.choice).join(' · ');show('twist',!!c?.twist);if(c?.twist)$('twist').textContent='⚗ Poisonous Twist: '+c.twist;renderTimer()}
+async function action(name,args={}){try{await rpc(name,{p_room:roomId,...args});await refresh()}catch(e){error(e)}}
+$('start').onclick=()=>action('poison_start',{p_minutes:Number($('duration').value)});$('draw').onclick=()=>action('poison_draw');$('voteA').onclick=()=>action('poison_vote',{p_choice:'A'});$('voteB').onclick=()=>action('poison_vote',{p_choice:'B'});$('showTwist').onclick=()=>action('poison_twist');$('close').onclick=()=>{if(confirm('End the session for both hosts?'))action('poison_close')};
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));show('play',b.dataset.tab==='play'&&!!roomId);show('studio',b.dataset.tab==='studio');if(b.dataset.tab==='play'&&!roomId)status('Create or join a room first. Question Studio is available anytime.')});
+async function loadLibrary(){const {data,error}=await sb.from('poison_library').select('*').order('created_at',{ascending:false});if(error)throw error;library=data||[];renderLibrary()}
+function clearForm(){$('form').reset();$('editId').value=''}$('cancelEdit').onclick=clearForm;
+$('form').onsubmit=async e=>{e.preventDefault();try{const obj={category:$('catInput').value.trim(),option_a:$('aInput').value.trim(),option_b:$('bInput').value.trim(),twist:$('twistInput').value.trim()};if(!obj.category||!obj.option_a||!obj.option_b)throw Error('Fill in category and both choices');const id=$('editId').value;let result;if(id)result=await sb.from('poison_library').update(obj).eq('id',id);else result=await sb.from('poison_library').insert({...obj,author_id:user.id});if(result.error)throw result.error;clearForm();await loadLibrary();status('Card saved to Supabase.')}catch(e){error(e)}};
+function renderLibrary(){const root=$('library');root.replaceChildren();if(!library.length)root.textContent='No cards yet. Add your first dilemma.';library.forEach(c=>{const d=document.createElement('div');d.className='entry';const title=document.createElement('strong');title.textContent=c.category;const p=document.createElement('p');p.textContent='A: '+c.option_a+' | B: '+c.option_b;const edit=document.createElement('button');edit.textContent='Edit';edit.onclick=()=>{$('editId').value=c.id;$('catInput').value=c.category;$('aInput').value=c.option_a;$('bInput').value=c.option_b;$('twistInput').value=c.twist||'';window.scrollTo({top:0,behavior:'smooth'})};const del=document.createElement('button');del.textContent='Delete';del.onclick=async()=>{if(!confirm('Delete this card?'))return;const {error:dbError}=await sb.from('poison_library').delete().eq('id',c.id);if(dbError)error(dbError);else await loadLibrary()};d.append(title,p,edit,del);root.append(d)})}
+$('export').onclick=()=>{const data=library.map(c=>({category:c.category,a:c.option_a,b:c.option_b,twist:c.twist}));const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download='pick-your-poison-backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+$('import').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{const data=JSON.parse(await file.text());if(!Array.isArray(data)||data.length>1000)throw Error('Expected an array of at most 1000 cards');const rows=data.map(c=>({author_id:user.id,category:String(c.category||'').trim(),option_a:String(c.a??c.option_a??'').trim(),option_b:String(c.b??c.option_b??'').trim(),twist:String(c.twist||'').trim()}));if(rows.some(c=>!c.category||!c.option_a||!c.option_b))throw Error('Invalid cards in import');if(!confirm('Add '+rows.length+' cards to your library?'))return;for(let i=0;i<rows.length;i+=100){const {error:dbError}=await sb.from('poison_library').insert(rows.slice(i,i+100));if(dbError)throw dbError}await loadLibrary();status('Cards imported.')}catch(e){error(e)}finally{e.target.value=''}};
+</script></body></html>
