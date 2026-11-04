@@ -1,3 +1,98 @@
+-- Run once in Supabase SQL Editor. This does not modify jar_* tables.
+create extension if not exists pgcrypto;
+create table if not exists public.poison_library (
+ id uuid primary key default gen_random_uuid(), author_id uuid not null references auth.users(id) on delete cascade,
+ category text not null, option_a text not null, option_b text not null, twist text not null default '',
+ created_at timestamptz not null default now(),
+ constraint poison_text_valid check (length(trim(category)) between 1 and 100 and length(trim(option_a)) between 1 and 500 and length(trim(option_b)) between 1 and 500 and length(twist)<=500)
+);
+create table if not exists public.poison_rooms (
+ id uuid primary key default gen_random_uuid(), code text not null unique,
+ host_id uuid not null references auth.users(id), guest_id uuid references auth.users(id),
+ started_at timestamptz, duration_seconds integer not null default 1800,
+ closed_at timestamptz, current_card uuid, twist_visible boolean not null default false,
+ created_at timestamptz not null default now(),
+ constraint poison_duration_valid check(duration_seconds between 300 and 7200)
+);
+create table if not exists public.poison_room_cards (
+ id uuid primary key default gen_random_uuid(), room_id uuid not null references public.poison_rooms(id) on delete cascade,
+ category text not null, option_a text not null, option_b text not null, twist text not null default '',
+ drawn_at timestamptz, created_at timestamptz not null default now()
+);
+create table if not exists public.poison_votes (
+ room_id uuid not null references public.poison_rooms(id) on delete cascade,
+ card_id uuid not null references public.poison_room_cards(id) on delete cascade,
+ player_id uuid not null references auth.users(id), choice text not null check(choice in ('A','B')),
+ primary key(card_id,player_id)
+);
+create index if not exists poison_room_cards_room_idx on public.poison_room_cards(room_id);
+create index if not exists poison_library_author_idx on public.poison_library(author_id);
+alter table public.poison_library enable row level security;
+alter table public.poison_rooms enable row level security;
+alter table public.poison_room_cards enable row level security;
+alter table public.poison_votes enable row level security;
+revoke all on public.poison_rooms,public.poison_room_cards,public.poison_votes from anon,authenticated;
+grant select,insert,update,delete on public.poison_library to authenticated;
+drop policy if exists poison_library_owner on public.poison_library;
+create policy poison_library_owner on public.poison_library for all to authenticated using(author_id=(select auth.uid())) with check(author_id=(select auth.uid()));
+-- Rooms/cards/votes are only accessed through validated SECURITY DEFINER RPCs.
+create or replace function public.poison_create() returns jsonb language plpgsql security definer set search_path='' as $$
+declare r public.poison_rooms; c text; i int;
+begin
+ if auth.uid() is null then raise exception 'Sign in first'; end if;
+ for i in 1..15 loop
+  c:=upper(substr(encode(gen_random_bytes(5),'hex'),1,8));
+  begin insert into public.poison_rooms(code,host_id) values(c,auth.uid()) returning * into r; exit;
+  exception when unique_violation then null; end;
+ end loop;
+ if r.id is null then raise exception 'Could not create room'; end if;
+ return jsonb_build_object('id',r.id,'code',r.code);
+end $$;
+create or replace function public.poison_join(p_code text) returns jsonb language plpgsql security definer set search_path='' as $$
+declare r public.poison_rooms;
+begin
+ if auth.uid() is null then raise exception 'Sign in first'; end if;
+ select * into r from public.poison_rooms where code=upper(trim(p_code)) for update;
+ if not found then raise exception 'Room not found'; end if;
+ if r.host_id<>auth.uid() and r.guest_id is distinct from auth.uid() then
+  if r.guest_id is not null then raise exception 'Room already has two players'; end if;
+  update public.poison_rooms set guest_id=auth.uid() where id=r.id;
+ end if;
+ return jsonb_build_object('id',r.id,'code',r.code);
+end $$;
+create or replace function public.poison_state(p_room uuid) returns jsonb language plpgsql security definer set search_path='' as $$
+declare r public.poison_rooms; c public.poison_room_cards; mine text; total int; drawn int; vote_count int; revealed boolean; result jsonb;
+begin
+ select * into r from public.poison_rooms where id=p_room;
+ if not found or auth.uid() is null or auth.uid() not in (r.host_id,r.guest_id) then raise exception 'Not a room member'; end if;
+ if r.current_card is not null then select * into c from public.poison_room_cards where id=r.current_card and room_id=p_room; end if;
+ select count(*) into total from public.poison_room_cards where room_id=p_room and drawn_at is null;
+ select count(*) into drawn from public.poison_room_cards where room_id=p_room and drawn_at is not null;
+ select count(*) into vote_count from public.poison_votes where card_id=r.current_card;
+ select choice into mine from public.poison_votes where card_id=r.current_card and player_id=auth.uid();
+ revealed:=vote_count=2;
+ result:=jsonb_build_object('code',r.code,'host',r.host_id=auth.uid(),'guest_connected',r.guest_id is not null,
+  'started_at',r.started_at,'closed_at',r.closed_at,'duration_seconds',r.duration_seconds,
+  'remaining',total,'drawn',drawn,'votes_cast',vote_count,'my_vote',mine,'revealed',revealed);
+ if c.id is not null then
+  result:=result||jsonb_build_object('card',jsonb_build_object('id',c.id,'category',c.category,'a',c.option_a,'b',c.option_b,'twist',case when r.twist_visible then c.twist else null end));
+  if revealed then result:=result||jsonb_build_object('votes',(select jsonb_agg(jsonb_build_object('player',case when v.player_id=r.host_id then 'Host' else 'Guest' end,'choice',v.choice) order by case when v.player_id=r.host_id then 0 else 1 end) from public.poison_votes v where v.card_id=c.id)); end if;
+ end if;
+ return result;
+end $$;
+create or replace function public.poison_start(p_room uuid,p_minutes integer default 30) returns void language plpgsql security definer set search_path='' as $$
+declare r public.poison_rooms;
+begin
+ select * into r from public.poison_rooms where id=p_room for update;
+ if not found or r.host_id<>auth.uid() then raise exception 'Only host can start'; end if;
+ if r.guest_id is null then raise exception 'Wait for the second player'; end if;
+ if r.started_at is not null then raise exception 'Already started'; end if;
+ if p_minutes not in (15,30,45,60) then raise exception 'Invalid duration'; end if;
+ insert into public.poison_room_cards(room_id,category,option_a,option_b,twist)
+ select p_room,category,option_a,option_b,twist from public.poison_library where author_id in (r.host_id,r.guest_id);
+ if not found then raise exception 'Add cards in Question Studio first'; end if;
+ update public.poison_rooms set started_at=now(),duration_seconds=p_minutes*60 where id=p_room;
+end $$;
 
 create or replace function public.poison_draw(p_room uuid)
 returns void
