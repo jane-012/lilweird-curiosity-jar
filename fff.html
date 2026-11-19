@@ -5,8 +5,8 @@
 <section id="game" class="hidden"><div class="panel"><div class="topline"><div><span class="eyebrow">Room</span> <strong id="code"></strong> <button id="copy" class="secondary" style="padding:6px 10px;font-size:12px">Copy</button></div><span class="pill" id="progress"></span></div><div class="scores" id="scores" style="margin-top:18px"></div></div><div class="panel"><div class="topline"><span class="eyebrow">The case file</span><span class="pill" id="status"></span></div><div class="question" id="statement"></div><div id="choices"><div class="options"><button class="option" data-guess="Fact">🔎 Fact</button><button class="option" data-guess="Folklore">📜 Folklore</button><button class="option" data-guess="Fiction">🎭 Fiction</button></div><div class="actions"><button id="submit" disabled>Lock my answer</button></div></div><div id="waiting" class="notice hidden"></div><div id="result" class="hidden"><div class="verdict" id="verdict"></div><p id="explanation"></p><p id="prompt" class="muted"></p><a id="source" class="hidden" target="_blank" rel="noopener noreferrer">Read source ↗</a></div><div class="actions"><button id="reveal" class="hidden">Reveal verdict</button><button id="next" class="hidden">Next case →</button></div></div><div class="actions"><button id="leave" class="secondary">Leave this room</button><button id="refresh" class="secondary">Refresh now</button></div></section><footer>Made for the LilWeird Universe · Research the stories. Question the extraordinary.</footer></div>
 <script>
 // SET THESE TWO VALUES BEFORE DEPLOYMENT. Use the PUBLIC anon/publishable key only.
-const SUPABASE_URL='YOUR_SUPABASE_URL';
-const SUPABASE_KEY='YOUR_SUPABASE_PUBLISHABLE_KEY';
+const SUPABASE_URL=https://dsiklsanwhtfyjqpzyhi.supabase.co;
+const SUPABASE_KEY=sb_publishable_0GL7DCc00vJ-bYnP-U5Ajw_sKGGh34F;
 const $=id=>document.getElementById(id);let session=JSON.parse(localStorage.getItem('lilweird_fff_session')||'null'),state=null,chosen=null,busy=false;
 const show=(id,yes)=>$(id).classList.toggle('hidden',!yes);
 const escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
